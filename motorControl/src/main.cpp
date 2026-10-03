@@ -32,11 +32,11 @@
 struct MotorPins { uint8_t step; uint8_t dir; };
 
 const MotorPins MOTOR_PINS[5][2] = {
-  /* A */ { {22, 23}, {24, 25} },
-  /* B */ { {26, 27}, {28, 29} },
-  /* C */ { {30, 31}, {32, 33} },
-  /* D */ { {34, 35}, {36, 37} },
-  /* E */ { {38, 39}, {40, 41} },
+  /* A */ { {47, 46}, {45, 44} },
+  /* B */ { {43, 42}, {41, 40} },
+  /* C */ { {39, 38}, {37, 36} },
+  /* D */ { {35, 34}, {33, 32} },
+  /* E */ { {31, 30}, {29, 28} },
 };
 
 const uint8_t START_BUTTON_PIN = 2;   // wired to GND, uses INPUT_PULLUP
@@ -45,16 +45,16 @@ const char    START_BYTE = 'S';       // any serial byte equal to this starts th
 // ---------------------------------------------------------------------
 // 2. MECHANICAL CONFIG
 // ---------------------------------------------------------------------
-const float STEPS_PER_MM[5]    = { 80, 80, 80, 80, 80 };
-const float MAX_SPEED_MM_S[5]  = { 60, 60, 60, 60, 60 };
+const float STEPS_PER_MM[5]    = { 13.333, 13.333, 13.333, 13.333, 13.333 };
+const float MAX_SPEED_MM_S[5]  = { 100, 100, 100, 100, 100 };
 
 // Per-motor direction sign, for mirrored mounting on a given axis.
 const int8_t DIR_SIGN[5][2] = {
-  { 1, -1 },  // A: motor 2 mounted mirrored
-  { 1,  1 },
-  { 1,  1 },
-  { 1,  1 },
-  { 1,  1 },
+  { -1, 1 },
+  { 1, 1 },
+  { 1, 1 },
+  { -1, -1 },
+  { -1, -1 },
 };
 
 // ---------------------------------------------------------------------
@@ -70,12 +70,17 @@ struct Move {
 };
 
 const Move SEQUENCE[] = {
-  { 0,    A, 50.0f, 40.0f },
-  { 3000, B, 20.0f, 25.0f },
-  { 3000, C, 20.0f, 25.0f },
-  { 6000, A, -50.0f, 40.0f },
-  { 8000, D, 10.0f, 15.0f },
-  { 9000, E, 30.0f, 20.0f },
+  { 0, A, 100.0f, 10.0f },
+  { 1000, B, 50, 25},
+  { 1000, D, 50, 25},
+  { 10000, B, -50, 25},
+  { 10000, D, -50, 25},
+
+  { 1000, C, 50, 25},
+  { 1000, E, 50, 25},
+  { 10000, C, -50, 25},
+  { 10000, E, -50, 25},
+  { 15000, A, -100.0f, 10.0f },
 };
 const size_t SEQUENCE_LEN = sizeof(SEQUENCE) / sizeof(SEQUENCE[0]);
 
