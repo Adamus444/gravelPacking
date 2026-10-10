@@ -6,9 +6,9 @@ const uint8_t PIN_CS = 10;
 SPISettings max6675Settings(4000000, MSBFIRST, SPI_MODE0);
 
 // ---------- 74HC595 4-digit display module ----------
-const uint8_t PIN_RCLK = 4;   // LCLK / latch
-const uint8_t PIN_SCLK = 7;   // shift clock
-const uint8_t PIN_DIO  = 8;   // data
+const uint8_t PIN_RCLK = 4;
+const uint8_t PIN_SCLK = 7;
+const uint8_t PIN_DIO  = 8;
 
 // Common-anode segment codes (0 = segment ON), bit order: dp g f e d c b a
 const uint8_t SEG_DIGITS[10] = {
@@ -16,18 +16,16 @@ const uint8_t SEG_DIGITS[10] = {
 };
 const uint8_t SEG_BLANK = 0xFF;
 const uint8_t SEG_DASH  = 0xBF;
-const uint8_t DP_MASK   = 0x7F;   // AND with this to turn the decimal point on
+const uint8_t DP_MASK   = 0x7F;
 
-// Digit select bytes (leftmost digit first)
-const uint8_t DIGIT_SEL[4] = {0x01, 0x02, 0x04, 0x08};
+// Reversed to match your module: index 0 = leftmost digit
+const uint8_t DIGIT_SEL[4] = {0x08, 0x04, 0x02, 0x01};
 
-// What is currently shown on each digit
 uint8_t displayBuf[4] = {SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK};
 
 unsigned long lastRead = 0;
-const unsigned long READ_INTERVAL = 500;  // ms (MAX6675 needs >= 220 ms)
+const unsigned long READ_INTERVAL = 500;
 
-// ---------- MAX6675 ----------
 float readThermocoupleC() {
   uint16_t raw;
 
@@ -45,21 +43,18 @@ float readThermocoupleC() {
   return raw * 0.25;
 }
 
-// ---------- Display helpers ----------
 void setDisplayError() {
   for (uint8_t i = 0; i < 4; i++) displayBuf[i] = SEG_DASH;
 }
 
 void setDisplayTemp(float tempC) {
   if (tempC < 100.0) {
-    // Format XX.X (e.g. " 5.3" or "25.3")
-    int v = (int)(tempC * 10.0 + 0.5);       // tenths of a degree
+    int v = (int)(tempC * 10.0 + 0.5);                      // tenths of a degree
     displayBuf[0] = (v >= 100) ? SEG_DIGITS[(v / 100) % 10] : SEG_BLANK;
-    displayBuf[1] = SEG_DIGITS[(v / 10) % 10] & DP_MASK;   // decimal point
+    displayBuf[1] = SEG_DIGITS[(v / 10) % 10] & DP_MASK;    // decimal point
     displayBuf[2] = SEG_DIGITS[v % 10];
     displayBuf[3] = SEG_BLANK;
   } else {
-    // 100 °C and above: show whole degrees, right-aligned (e.g. " 123", "1023")
     int v = (int)(tempC + 0.5);
     displayBuf[0] = (v >= 1000) ? SEG_DIGITS[(v / 1000) % 10] : SEG_BLANK;
     displayBuf[1] = SEG_DIGITS[(v / 100) % 10];
@@ -68,16 +63,15 @@ void setDisplayTemp(float tempC) {
   }
 }
 
-// Multiplex: light one digit at a time, call this continuously
 void refreshDisplay() {
   for (uint8_t i = 0; i < 4; i++) {
     digitalWrite(PIN_RCLK, LOW);
-    shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, displayBuf[i]);  // segments
-    shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, DIGIT_SEL[i]);   // digit select
+    shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, displayBuf[i]);   // segments
+    shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, DIGIT_SEL[i]);    // digit select
     digitalWrite(PIN_RCLK, HIGH);
     delay(2);
   }
-  // Blank after the last digit to avoid ghosting
+  // Blank to avoid ghosting
   digitalWrite(PIN_RCLK, LOW);
   shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, SEG_BLANK);
   shiftOut(PIN_DIO, PIN_SCLK, MSBFIRST, 0x00);
@@ -96,7 +90,7 @@ void setup() {
   pinMode(PIN_DIO, OUTPUT);
 
   Serial.println("MAX6675 + 74HC595 display");
-  delay(500);  // let the MAX6675 stabilize
+  delay(500);
 }
 
 void loop() {
@@ -119,5 +113,5 @@ void loop() {
     }
   }
 
-  refreshDisplay();  // must run constantly, no long delays in loop()
+  refreshDisplay();
 }
