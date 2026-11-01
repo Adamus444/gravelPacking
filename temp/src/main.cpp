@@ -8,7 +8,7 @@
 
 // Pot range: 0 V -> TEMP_MIN, 5 V -> TEMP_MAX (degrees C)
 #define TEMP_MIN      80
-#define TEMP_MAX      120
+#define TEMP_MAX      140
 #define TEMP_STEP     1      // setpoint resolution in degrees C
 #define HEATER_OFF_AT_MIN 1  // 1 = pot fully at minimum switches the heater off
 

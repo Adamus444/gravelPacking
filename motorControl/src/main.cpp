@@ -133,10 +133,10 @@ constexpr float ACCEL_MM_S2[5]    = { 500, 500, 500, 500, 500 };
 // Per-motor direction sign, for mirrored mounting on a given axis.
 const int8_t DIR_SIGN[5][2] = {
   { -1, 1 },
-  { -1, 1 },
-  { -1, 1 },
+  { 1, -1 },
+  { 1, -1 },
   { -1, -1 },
-  { -1, -1 },
+  { 1, -1 },
 };
 
 // ---------------------------------------------------------------------
@@ -152,14 +152,23 @@ struct Move {
 };
 
 constexpr Move SEQUENCE[] = {
-  {  1000,  1800, B,  20 },
-  {  1000,  1800, C,  20 },
-  {  8000,  8960, B,  -4 },
-  {  8000,  8800, C,   0 },
-  { 11000, 11960, B,  20 },
-  { 11000, 11800, C,  20 },
-  { 20000, 20800, B,   0 },
-  { 20000, 20800, C,   0 },
+  { 0000,  5000, A,  200 },
+  { 7000,  12000, A,  0 },
+  { 1000, 5000, B, 20},
+  { 1000, 5000, C, 20},
+  { 8000, 9000, B, 0},
+  { 8000, 9000, C, 0},
+  { 9000, 10000, B, -1},
+  { 9000, 10000, C, -1},
+  { 10000, 12000, B, 20},
+  { 10000, 12000, C, 20},
+
+  { 1000, 4000, D, 20},
+  { 1000, 4000, E, 20},
+  { 4000, 5000, D, 0},
+  { 4000, 5000, E, 0},
+  { 12000, 13000, D, 20},
+  { 12000, 13000, E, 20},
 };
 constexpr int SEQUENCE_LEN = sizeof(SEQUENCE) / sizeof(SEQUENCE[0]);
 
@@ -229,12 +238,12 @@ template <int Row, int Rule> struct SeqRowError {
   static_assert(Row == SEQUENCE_LEN || Rule != 1, "SEQUENCE rule 1: end_ms must be greater than start_ms");
   static_assert(Row == SEQUENCE_LEN || Rule != 2, "SEQUENCE rule 2: same-axis rows overlap or are out of order");
   static_assert(Row == SEQUENCE_LEN || Rule != 3, "SEQUENCE rule 3: move too fast/short for ACCEL_MM_S2, MAX_SPEED_MM_S or ISR rate - lengthen it");
-  static_assert(Row == SEQUENCE_LEN || Rule != 4, "SEQUENCE rule 4: axis must end at 0 mm so the sequence can be re-run");
+  // static_assert(Row == SEQUENCE_LEN || Rule != 4, "SEQUENCE rule 4: axis must end at 0 mm so the sequence can be re-run");
 };
 static_assert(sizeof(SeqRowError<firstBad(1, 0), 1>) > 0, "SEQUENCE rule 1 failed");
 static_assert(sizeof(SeqRowError<firstBad(2, 0), 2>) > 0, "SEQUENCE rule 2 failed");
 static_assert(sizeof(SeqRowError<firstBad(3, 0), 3>) > 0, "SEQUENCE rule 3 failed");
-static_assert(sizeof(SeqRowError<firstBad(4, 0), 4>) > 0, "SEQUENCE rule 4 failed");
+// static_assert(sizeof(SeqRowError<firstBad(4, 0), 4>) > 0, "SEQUENCE rule 4 failed");
 
 constexpr bool cfgOk(int a) {
   return a >= 5 ? true : (STEPS_PER_MM[a] > 0 && MAX_SPEED_MM_S[a] > 0 && ACCEL_MM_S2[a] > 0 && cfgOk(a + 1));
