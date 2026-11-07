@@ -1,10 +1,26 @@
 #pragma once
-
+/*
+ * choreography.h -- THE SHOW. This is the file you edit for a new routine.
+ *
+ * Every row is   { start_ms, end_ms, AXIS, target_position_mm }
+ *   "Move AXIS so it is AT target_position_mm at end_ms, starting the motion
+ *    at start_ms." Positions are ABSOLUTE (0 = power-up position). Times are
+ *    ms from that sequence's own trigger. Speed is derived from distance and
+ *    duration. Axes not mentioned hold position.
+*/
 #include <Arduino.h>
 
 
+// Global time scale for ALL rows of ALL sequences.
+// Too small a value makes rule 3 (achievable move) fail to compile.
+constexpr float TIME_MULT = 1.0f;
+static_assert(TIME_MULT > 0, "TIME_MULT must be > 0");
+ 
+constexpr uint32_t scaleMs(float t) { return (uint32_t)(t * TIME_MULT + 0.5f); }
+ 
+
+
 enum AxisId { A = 0, B = 1, C = 2, D = 3, E = 4 };
-#define TIME_MULT 1.5 // so i dont have to rewrite the sequence
 
 struct Move {
   uint32_t start_ms;   // motion begins, ms after this sequence's trigger
@@ -23,7 +39,7 @@ constexpr Move PRE_SEQUENCE[] = {
 
 // MAIN: starts at base, must end at base (rule 4) so it can repeat.
 constexpr Move MAIN_SEQUENCE[] = {
-    { (uint32_t)(0000*TIME_MULT),  (uint32_t)(6000*mult), A,  270 },
+    { 0000, 6000, A,  270 },
     { (uint32_t)(7000*TIME_MULT),  (uint32_t)(13000*mult), A,  0 },
     
     { (uint32_t)(8000*mult), (uint32_t)(9000*mult), B, -1},
@@ -46,6 +62,8 @@ constexpr Move POST_SEQUENCE[] = {
   { 0, 2000, E, 0 },
 };
 
+
+// dont touch
 constexpr int PRE_LEN  = sizeof(PRE_SEQUENCE)  / sizeof(PRE_SEQUENCE[0]);
 constexpr int MAIN_LEN = sizeof(MAIN_SEQUENCE) / sizeof(MAIN_SEQUENCE[0]);
 constexpr int POST_LEN = sizeof(POST_SEQUENCE) / sizeof(POST_SEQUENCE[0]);

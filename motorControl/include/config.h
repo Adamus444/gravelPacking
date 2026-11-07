@@ -1,8 +1,17 @@
 #pragma once
+/*
+ * config.h -- MACHINE configuration. Set once per machine, rarely touched.
+ * Everything here is compile-time. The show itself (timings, positions)
+ * lives in choreography.h.
+ *
+ * Note: the arrays below are only read at runtime by stepper.cpp. Other
+ * files use them in compile-time checks only, so the compiler keeps a single
+ * copy in RAM. Keep it that way (don't index these arrays from main.cpp).
+ */
+
 #include <Arduino.h>
-// ---------------------------------------------------------------------
-//      PIN MAP
-// ---------------------------------------------------------------------
+
+// PIN MAP
 struct MotorPins { uint8_t step; uint8_t dir; };
 
 const MotorPins MOTOR_PINS[5][2] = {
@@ -12,18 +21,16 @@ const MotorPins MOTOR_PINS[5][2] = {
   /* D */ { {35, 34}, {33, 32} },
   /* E */ { {31, 30}, {29, 28} },
 };
- -- edit to match your wiring
+
 const uint8_t START_BUTTON_PIN = 2;   // wired to GND, uses INPUT_PULLUP
 const char    PRE_BYTE   = 'P';       // serial: run PRE_SEQUENCE  (only accepted at 0)
 const char    START_BYTE = 'S';       // serial / button: run MAIN_SEQUENCE (only at base)
 const char    POST_BYTE  = 'Z';       // serial: run POST_SEQUENCE (only at base)
 
-// ---------------------------------------------------------------------
 // MECHANICAL CONFIG (all compile-time)
-// ---------------------------------------------------------------------
 constexpr float STEPS_PER_MM[5]   = { 13.333f, 13.333f, 13.333f, 13.333f, 13.333f };
 constexpr float MAX_SPEED_MM_S[5] = { 100, 100, 100, 100, 100 };
-// PLACEHOLDER - tune on the machine. Higher = shorter ramps but more stall
+// Higher = shorter ramps but more stall
 // risk. Rule 3 rejects moves too short for this accel.
 constexpr float ACCEL_MM_S2[5]    = { 50, 50, 50, 50, 50 };
 
