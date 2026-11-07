@@ -32,6 +32,28 @@
  *  the run ends (no queued surprise runs). Other bytes (e.g. '\n') are
  *  ignored. Serial prints "START <name>" and "DONE <name>".
  *  The button triggers MAIN only, once per press.
+ *
+ *  JOG (re-zeroing):  J<axis><motor><mm>   then newline, e.g.
+ *        JA0 5      JB1-2.5      Jc0 0.3      JD2 1
+ *    Physically steps ONE motor of one axis by a signed distance in mm, at
+ *    JOG_SPEED_MM_S, WITHOUT updating the tracked position. axis = A-E,
+ *    motor = 0 or 1 (the first / second entry of that axis in MOTOR_PINS),
+ *    or 2 for both motors together. Positive = the direction that motor
+ *    would turn for a positive position (DIR_SIGN is applied per motor).
+ *    A space between the motor digit and the distance is optional.
+ *    The firmware still believes the axis is where it was, so the 0 mm
+ *    (and base) reference moves by the jogged amount. Use it to nudge
+ *    the machine onto its true zero before 'P', or to fine-tune base.
+ *    NOTE: jogging a single motor of a dual-motor axis changes the
+ *    alignment between its two motors (that is the point, e.g. squaring a
+ *    gantry); all later moves keep that offset.
+ *    Only accepted while no sequence is running, and only if that axis is
+ *    not already moving. Serial prints "JOG <axis><motor> <mm> (<n> steps)"
+ *    and "JOG DONE". The line MUST end with a newline (set the Serial
+ *    Monitor to "Newline"); it is dropped if more than JOG_LINE_TIMEOUT_MS
+ *    (2 s) passes between typed characters. Moves are limited to
+ *    +/- JOG_MAX_MM per command; send several for longer jogs.
+ *    While any axis is jogging, P/S/Z/button are ignored.
  *  There is NO abort/e-stop in firmware: a running sequence always
  *  finishes. Cut driver power for an emergency.
  *  Each table needs at least one row. For a no-op PRE/POST, use a
@@ -123,7 +145,11 @@
  *    (replaced boot-time validation), re-runnable sequence, ISR 20k ->
  *    10 kHz. v4 PRE/MAIN/POST sequences with serial commands P/S/Z and
  *    position-state gating; MAIN no longer has to end at 0 (it must end at
- *    base); button is now edge-triggered (one trigger per press).
+ *    base); button is now edge-triggered (one trigger per press). v5 serial
+ *    JOG command ('JA0 5', 'JB1-2.5'): steps one motor (or both) of an axis
+ *    without updating the tracked position, shifting the machine's zero;
+ *    startAxisMove split into commitMove() + wrapper; per-motor step mask in
+ *    the ISR (AxisState.motorMask); jog line timeout 2 s.
  *
  * No AccelStepper/MultiStepper dependency - self-contained beyond avr/io.h,
  * which Arduino.h already pulls in.
@@ -156,7 +182,13 @@ constexpr float STEPS_PER_MM[5]   = { 13.333f, 13.333f, 13.333f, 13.333f, 13.333
 constexpr float MAX_SPEED_MM_S[5] = { 100, 100, 100, 100, 100 };
 // PLACEHOLDER - tune on the machine. Higher = shorter ramps but more stall
 // risk. Rule 3 rejects moves too short for this accel.
-constexpr float ACCEL_MM_S2[5]    = { 500, 500, 500, 500, 500 };
+constexpr float ACCEL_MM_S2[5]    = { 50, 50, 50, 50, 50 };
+
+// Manual jog (serial 'J' command): cruise speed and per-command distance cap.
+// Jogs use ACCEL_MM_S2 for their ramps and never change the tracked position.
+constexpr float JOG_SPEED_MM_S = 10;   // keep modest: you are positioning by eye
+constexpr float JOG_MAX_MM     = 100;  // reject typos like JA0 5000
+constexpr uint32_t JOG_LINE_TIMEOUT_MS = 2000; // max gap between typed chars of a J line
 
 // Per-motor direction sign, for mirrored mounting on a given axis.
 const int8_t DIR_SIGN[5][2] = {
@@ -189,22 +221,21 @@ constexpr Move PRE_SEQUENCE[] = {
 };
 
 // MAIN: starts at base, must end at base (rule 4) so it can repeat.
+constexpr float mult = 1.5;
 constexpr Move MAIN_SEQUENCE[] = {
-    { 0000,  6000, A,  250 },
-    { 7000,  13000, A,  0 },
-    // { 1000, 5000, B, 30},
-    // { 1000, 5000, C, 30},
-    { 8000, 9000, B, -1},
-    { 8000, 9000, C, -1},
-    // { 9000, 10000, B, -1},
-    // { 9000, 10000, C, -1},
-    { 11000, 12000, B, 30},
-    { 11000, 12000, C, 30},
+    { (uint32_t)(0000*mult),  (uint32_t)(6000*mult), A,  270 },
+    { (uint32_t)(7000*mult),  (uint32_t)(13000*mult), A,  0 },
+    
+    { (uint32_t)(8000*mult), (uint32_t)(9000*mult), B, -1},
+    { (uint32_t)(8000*mult), (uint32_t)(9000*mult), C, -1},
+    
+    { (uint32_t)(11000*mult), (uint32_t)(12000*mult), B, 30},
+    { (uint32_t)(11000*mult), (uint32_t)(12000*mult), C, 30},
 
-    { 6000, 7000, D, -4},
-    { 6000, 7000, E, 0},
-    { 13000, 14000, D, 30},
-    { 13000, 14000, E, 30},
+    { (uint32_t)(6000*mult), (uint32_t)(7000*mult), D, -4},
+    { (uint32_t)(6000*mult), (uint32_t)(7000*mult), E, 0},
+    { (uint32_t)(13000*mult), (uint32_t)(14000*mult), D, 30},
+    { (uint32_t)(13000*mult), (uint32_t)(14000*mult), E, 30},
 };
 
 // POST: base -> 0 on every axis (rule 4). Axes already at 0 need no row.
@@ -331,6 +362,12 @@ constexpr bool cfgOk(int a) {
 }
 static_assert(cfgOk(0), "STEPS_PER_MM, MAX_SPEED_MM_S and ACCEL_MM_S2 must all be > 0");
 
+constexpr bool jogOk(int a) {
+  return a >= 5 ? true : (JOG_SPEED_MM_S * STEPS_PER_MM[a] <= vLimitSteps(a) && jogOk(a + 1));
+}
+static_assert(JOG_SPEED_MM_S > 0 && JOG_MAX_MM > 0, "JOG_SPEED_MM_S and JOG_MAX_MM must be > 0");
+static_assert(jogOk(0), "JOG_SPEED_MM_S exceeds MAX_SPEED_MM_S or the ISR step-rate limit on some axis");
+
 // ---------------------------------------------------------------------
 // 5. RUNTIME STATE
 // ---------------------------------------------------------------------
@@ -348,6 +385,7 @@ struct AxisState {
   volatile uint32_t vCruise;        // peak rate
   volatile uint32_t vFloor;         // start/end rate
   volatile uint32_t accel;          // rate change per tick
+  volatile uint8_t  motorMask;      // bit0 = motor 0, bit1 = motor 1: which get step pulses
   volatile bool     pulseHigh;
   volatile bool     active;
 };
@@ -390,6 +428,7 @@ void setup() {
     axisState[axis].vCruise = 0;
     axisState[axis].vFloor = 0;
     axisState[axis].accel = 0;
+    axisState[axis].motorMask = 3;
     axisState[axis].pulseHigh = false;
     axisState[axis].active = false;
   }
@@ -439,8 +478,9 @@ ISR(TIMER1_COMPA_vect) {
       uint32_t p = old + v;
       s.phase = p;
       if (p < old) { // carry -> step
-        *stepReg[axis][0] |= stepMask[axis][0];
-        *stepReg[axis][1] |= stepMask[axis][1];
+        uint8_t mm = s.motorMask;
+        if (mm & 1) *stepReg[axis][0] |= stepMask[axis][0];
+        if (mm & 2) *stepReg[axis][1] |= stepMask[axis][1];
         s.pulseHigh = true;
         s.stepsRemaining--;
       }
@@ -458,24 +498,15 @@ static uint32_t toFix(float stepsPerSec) {
 }
 
 // ---------------------------------------------------------------------
-// Arm a move: go to absolute target_mm, taking duration_ms. Returns false
-// if the axis is still busy (caller retries). All float math happens first;
-// interrupts are off only for the short commit.
+// Shared arming code: emit |delta| steps on one axis (sign = direction) with
+// a trapezoid/triangle of peak vPeak (steps/s) and accel A (steps/s^2).
+// motorMask selects the motors that move (bit0 = motor 0, bit1 = motor 1);
+// the other motor's step AND dir pins are left alone.
+// Does NOT touch posSteps -- callers decide whether the move is "remembered".
+// Float math first; interrupts are off only for the short commit.
+// Caller guarantees the axis is idle and delta != 0.
 // ---------------------------------------------------------------------
-bool startAxisMove(AxisId axis, float target_mm, uint32_t duration_ms) {
-  if (axisState[axis].active) return false;
-
-  int32_t target = toSteps(target_mm, axis);
-  int32_t delta  = target - posSteps[axis];
-  if (delta == 0) return true;
-
-  float D = (float)labs(delta);                         // steps
-  float T = (float)duration_ms * 0.001f;                // s
-  float A = ACCEL_MM_S2[axis] * STEPS_PER_MM[axis];     // steps/s^2
-
-  float disc = T * T - 4.0f * D / A;
-  if (disc < 0) disc = 0;                               // rule 3 rules this out at compile time
-  float vPeak  = 2.0f * D / (T + sqrtf(disc));          // steps/s
+static void commitMove(uint8_t axis, uint8_t motorMask, int32_t delta, float vPeak, float A) {
   float vFloor = sqrtf(A);
   if (vFloor > vPeak) vFloor = vPeak;
   int32_t decelSteps = (int32_t)(vPeak * vPeak / (2.0f * A) + 0.5f);
@@ -491,6 +522,7 @@ bool startAxisMove(AxisId axis, float target_mm, uint32_t duration_ms) {
 
   noInterrupts();
   for (uint8_t m = 0; m < 2; m++) {
+    if (!(motorMask & (1 << m))) continue;
     if (dir * DIR_SIGN[axis][m] >= 0) *dirReg[axis][m] |= dirMask[axis][m];
     else                              *dirReg[axis][m] &= ~dirMask[axis][m];
   }
@@ -501,12 +533,102 @@ bool startAxisMove(AxisId axis, float target_mm, uint32_t duration_ms) {
   axisState[axis].vCruise = cruiseFix;
   axisState[axis].vFloor = floorFix;
   axisState[axis].accel = accelFix;
+  axisState[axis].motorMask = motorMask;
   axisState[axis].pulseHigh = false;
   axisState[axis].active = true;
   interrupts();
+}
 
+// ---------------------------------------------------------------------
+// Arm a move: go to absolute target_mm, taking duration_ms. Returns false
+// if the axis is still busy (caller retries). Updates the tracked position.
+// ---------------------------------------------------------------------
+bool startAxisMove(AxisId axis, float target_mm, uint32_t duration_ms) {
+  if (axisState[axis].active) return false;
+
+  int32_t target = toSteps(target_mm, axis);
+  int32_t delta  = target - posSteps[axis];
+  if (delta == 0) return true;
+
+  float D = (float)labs(delta);                         // steps
+  float T = (float)duration_ms * 0.001f;                // s
+  float A = ACCEL_MM_S2[axis] * STEPS_PER_MM[axis];     // steps/s^2
+
+  float disc = T * T - 4.0f * D / A;
+  if (disc < 0) disc = 0;                               // rule 3 rules this out at compile time
+  float vPeak  = 2.0f * D / (T + sqrtf(disc));          // steps/s
+
+  commitMove(axis, 3, delta, vPeak, A);               // both motors
   posSteps[axis] = target;
   return true;
+}
+
+// ---------------------------------------------------------------------
+// JOG: step one motor (motorMask 1 = motor 0, 2 = motor 1) or both (3) of an axis by a relative
+// distance WITHOUT updating posSteps, so the firmware's idea of "where the
+// axis is" stays put while the metal moves. Net effect: the machine's 0 /
+// base reference shifts by the jogged amount.
+// Returns false if the axis is busy. Constant JOG_SPEED_MM_S, shortened to a
+// triangle profile for tiny jogs.
+// ---------------------------------------------------------------------
+bool jogAxis(uint8_t axis, uint8_t motorMask, float mm, int32_t &stepsOut) {
+  stepsOut = 0;
+  if (axisState[axis].active) return false;
+
+  int32_t delta = toSteps(mm, axis);
+  stepsOut = delta;
+  if (delta == 0) return true;
+
+  float D = (float)labs(delta);
+  float A = ACCEL_MM_S2[axis] * STEPS_PER_MM[axis];
+  float vPeak = JOG_SPEED_MM_S * STEPS_PER_MM[axis];
+  float vTri  = sqrtf(A * D);                           // peak of a pure triangle over D
+  if (vTri < vPeak) vPeak = vTri;
+
+  commitMove(axis, motorMask, delta, vPeak, A);         // posSteps deliberately NOT updated
+  return true;
+}
+
+// Parse the text after 'J': "<axis A-E><signed mm>", e.g. "A5", "b-2.5".
+bool jogPending = false;     // a jog was started; announce JOG DONE when it ends
+
+void handleJogLine(const char *p) {
+  while (*p == ' ') p++;
+  char ax = (char)toupper((unsigned char)*p);
+  if (ax < 'A' || ax > 'E') {
+    Serial.println(F("JOG ERR: expected J<axis A-E><motor 0-2><mm>, e.g. JA0 5 or JB1-2.5"));
+    return;
+  }
+  p++;
+  while (*p == ' ') p++;
+  if (*p < '0' || *p > '2') {
+    Serial.println(F("JOG ERR: motor must be 0, 1 or 2 (both), e.g. JA0 5"));
+    return;
+  }
+  uint8_t motor = (uint8_t)(*p - '0');
+  uint8_t motorMask = (motor == 2) ? 3 : (uint8_t)(1 << motor);   // 0 -> bit0, 1 -> bit1, 2 -> both
+  p++;
+  char *end;
+  float mm = (float)strtod(p, &end);
+  if (end == p) {
+    Serial.println(F("JOG ERR: missing distance, e.g. JA0 5 or JB1-2.5"));
+    return;
+  }
+  if (!(fabsf(mm) <= JOG_MAX_MM)) {
+    Serial.print(F("JOG ERR: |distance| must be <= ")); Serial.print(JOG_MAX_MM, 1); Serial.println(F(" mm"));
+    return;
+  }
+
+  uint8_t axis = (uint8_t)(ax - 'A');
+  int32_t steps;
+  if (!jogAxis(axis, motorMask, mm, steps)) {
+    Serial.print(F("JOG ERR: axis ")); Serial.print(ax); Serial.println(F(" is busy"));
+    return;
+  }
+  Serial.print(F("JOG ")); Serial.print(ax); Serial.print(motor); Serial.print(' ');
+  Serial.print(mm, 3); Serial.print(F(" mm ("));
+  Serial.print(steps); Serial.println(F(" steps) - zero reference shifted"));
+  if (steps != 0) jogPending = true;
 }
 
 // ---------------------------------------------------------------------
@@ -546,7 +668,47 @@ void beginSequence(int id) {
 
 void loop() {
   if (!running) {
+    // --- jog line collection (after a 'J'), serial only ---
+    static bool     jogCollecting = false;
+    static char     jogBuf[24];
+    static uint8_t  jogLen = 0;
+    static uint32_t jogLastRx = 0;
+
+    if (jogCollecting) {
+      while (Serial.available() > 0) {
+        char ch = (char)Serial.read();
+        jogLastRx = millis();
+        if (ch == '\n' || ch == '\r') {
+          jogBuf[jogLen] = 0;
+          jogCollecting = false;
+          handleJogLine(jogBuf);
+          break;
+        }
+        if (jogLen < sizeof(jogBuf) - 1) jogBuf[jogLen++] = ch;
+      }
+      if (jogCollecting && millis() - jogLastRx > JOG_LINE_TIMEOUT_MS) {
+        jogCollecting = false;
+        Serial.println(F("JOG ERR: line not finished in time, dropped"));
+      }
+      return;
+    }
+
+    if (jogPending && !anyAxisActive()) {
+      jogPending = false;
+      Serial.println(F("JOG DONE"));
+    }
+
     char c = readCommand();
+    if (c == 'J' || c == 'j') {
+      jogCollecting = true;
+      jogLen = 0;
+      jogLastRx = millis();
+      return;
+    }
+    if ((c == PRE_BYTE || c == START_BYTE || c == POST_BYTE) && anyAxisActive()) {
+      Serial.println(F("IGNORED: a jog is still moving"));
+      return;
+    }
     if (c == PRE_BYTE) {
       if (atBase) Serial.println(F("IGNORED P: already at base, send Z first"));
       else        beginSequence(0);
