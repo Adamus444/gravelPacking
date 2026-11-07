@@ -1,44 +1,68 @@
 /*
- * Fixed choreography sequencer, ISR-driven stepping (grbl-style).
+ * Choreography sequencer (PRE / MAIN / POST), ISR-driven stepping (grbl-style).
  * Arduino Mega 2560, 5 dual-motor axes (A-E) on TB6600 drivers.
  *
  * ---------------------------------------------------------------------
  * HOW TO USE (read this first)
  * ---------------------------------------------------------------------
- *  - Edit SEQUENCE[] in section 3. Each row is:
+ *  Three tables in section 3, all with the same row format:
  *        { start_ms, end_ms, AXIS, target_position_mm }
- *    "Move AXIS so it is AT target_position_mm at end_ms, starting the
- *    motion at start_ms." Positions are ABSOLUTE. Speed is NOT an input:
- *    it is derived from distance and duration (see MOTION PROFILE).
- *  - Times are ms from the trigger (serial byte 'S' or the start button).
- *  - Every axis is assumed to be at 0 mm at power-up / reset. Home the
- *    machine by hand BEFORE powering on. Position is tracked in steps in
- *    RAM only (no feedback). Axes not mentioned in a row hold position.
- *  - When the sequence finishes, the firmware prints "DONE" on Serial,
- *    discards any 'S' bytes received during the run, waits for the button
- *    to be released, and is ready to run again. Re-running needs no reset.
+ *  "Move AXIS so it is AT target_position_mm at end_ms, starting the
+ *  motion at start_ms." Positions are ABSOLUTE. Speed is NOT an input: it
+ *  is derived from distance and duration (see MOTION PROFILE). Times are
+ *  ms from that sequence's own trigger. Axes not mentioned hold position.
+ *
+ *    PRE_SEQUENCE   serial 'P'   Power-up (0 mm everywhere) -> production
+ *                                start position ("base"). Run once, at the
+ *                                very start of production.
+ *    MAIN_SEQUENCE  serial 'S'   The show. Repeatable any number of times.
+ *                  or button     Starts at base and must END at base.
+ *    POST_SEQUENCE  serial 'Z'   base -> 0 mm on every axis (end of
+ *                                production / before power-off).
+ *
+ *  Every axis is assumed to be at 0 mm at power-up / reset. Home the
+ *  machine by hand BEFORE powering on. Position is tracked in steps in RAM
+ *  only (no feedback), so a reset forgets where the machine is.
+ *
+ *  Allowed order (a human drives it; anything else is ignored with a
+ *  message on Serial @115200):
+ *        at 0 --P--> at base --S--> at base --S--> ... --Z--> at 0
+ *  P is only accepted at 0, S and Z only at base, and nothing is accepted
+ *  while a sequence is running. Bytes received mid-run are discarded when
+ *  the run ends (no queued surprise runs). Other bytes (e.g. '\n') are
+ *  ignored. Serial prints "START <name>" and "DONE <name>".
+ *  The button triggers MAIN only, once per press.
+ *  There is NO abort/e-stop in firmware: a running sequence always
+ *  finishes. Cut driver power for an emergency.
+ *  Each table needs at least one row. For a no-op PRE/POST, use a
+ *  zero-distance row, e.g. { 0, 1000, A, 0 } (a move to where it already is
+ *  does nothing).
  *
  * ---------------------------------------------------------------------
  * COMPILE-TIME CHECKS (static_assert; config is compile-time only)
  * ---------------------------------------------------------------------
- *  SEQUENCE[] is checked while compiling. A failure shows a message and,
- *  in the "In instantiation of 'struct SeqRowError<ROW, RULE>'" line, the
- *  offending ROW index (0-based) and RULE number:
+ *  "base" is derived, not configured: base = where PRE leaves each axis
+ *  (0 for axes PRE doesn't touch). All three tables are checked while
+ *  compiling. A failure shows a message and, in the
+ *  "In instantiation of 'struct SeqError<INDEX, RULE, SEQ>'" line, the
+ *  INDEX (row, or axis number 0-4 for rule 4), the RULE and SEQ
+ *  (0 = PRE, 1 = MAIN, 2 = POST):
  *    1. end_ms > start_ms.
  *    2. Rows of the same axis are in chronological order in the table and
  *       do not overlap (start_ms >= previous end_ms; touching is fine).
  *       Rows of different axes may be in any order / overlap freely.
- *    3. The move is physically achievable: the duration is long enough for
- *       the axis accel (a trapezoid/triangle profile exists) and the peak
- *       speed stays <= MAX_SPEED_MM_S and <= the ISR limit.
+ *    3. The move is physically achievable from the position the axis is at
+ *       when the row starts: the duration is long enough for the axis
+ *       accel (a trapezoid/triangle profile exists) and the peak speed
+ *       stays <= MAX_SPEED_MM_S and <= the ISR limit.
  *       Fix: lengthen the duration, shorten the distance, or raise the
  *       limits in section 2.
- *    4. Each axis ENDS at 0 mm, so the sequence can be re-run (a re-run
- *       starts from where the last run ended; rule 3 only validates moves
- *       from the positions inside the table).
+ *    4. End positions: MAIN must end every axis where MAIN started it
+ *       (= base), so it can repeat. POST must end every axis at 0 mm.
+ *       (PRE has no end rule.)
  *  Also checked: positive STEPS_PER_MM / MAX_SPEED_MM_S / ACCEL_MM_S2.
  *  Needs C++11 constexpr (Arduino AVR default). The recursion depth limit
- *  (-fconstexpr-depth, default 512) caps the table at roughly 250 rows;
+ *  (-fconstexpr-depth, default 512) caps a table at roughly 200 rows;
  *  raise the flag if you need more.
  *
  * ---------------------------------------------------------------------
@@ -75,8 +99,8 @@
  *    per tick, so ISR_FREQ_HZ is a CPU-budget tradeoff: 10 kHz was chosen
  *    to leave headroom with all 5 axes moving at once. If you raise it,
  *    measure ISR time (toggle a spare pin) first.
- *  - loop() never touches a step pin. It waits for the trigger, then arms
- *    moves when millis() reaches each row's start_ms.
+ *  - loop() never touches a step pin. It reads commands, then arms moves
+ *    when millis() reaches each row's start_ms.
  *  - Both motors of an axis get the same step pulse; per-motor direction is
  *    handled by DIR_SIGN (mirrored mounting).
  *
@@ -96,8 +120,10 @@
  *    allowed and intentional.
  *  - Change log: v2 absolute positions + start/end timestamps; dir-pin RMW
  *    race fixed. v3 trapezoidal accel/decel, compile-time sequence checks
- *    (replaced boot-time validation), sequence re-runnable (the old
- *    one-shot sequenceStarted flag was never cleared), ISR 20k -> 10 kHz.
+ *    (replaced boot-time validation), re-runnable sequence, ISR 20k ->
+ *    10 kHz. v4 PRE/MAIN/POST sequences with serial commands P/S/Z and
+ *    position-state gating; MAIN no longer has to end at 0 (it must end at
+ *    base); button is now edge-triggered (one trigger per press).
  *
  * No AccelStepper/MultiStepper dependency - self-contained beyond avr/io.h,
  * which Arduino.h already pulls in.
@@ -119,7 +145,9 @@ const MotorPins MOTOR_PINS[5][2] = {
 };
 
 const uint8_t START_BUTTON_PIN = 2;   // wired to GND, uses INPUT_PULLUP
-const char    START_BYTE = 'S';       // any serial byte equal to this starts the sequence
+const char    PRE_BYTE   = 'P';       // serial: run PRE_SEQUENCE  (only accepted at 0)
+const char    START_BYTE = 'S';       // serial / button: run MAIN_SEQUENCE (only at base)
+const char    POST_BYTE  = 'Z';       // serial: run POST_SEQUENCE (only at base)
 
 // ---------------------------------------------------------------------
 // 2. MECHANICAL CONFIG (all compile-time)
@@ -140,37 +168,65 @@ const int8_t DIR_SIGN[5][2] = {
 };
 
 // ---------------------------------------------------------------------
-// 3. CHOREOGRAPHY -- edit this table for a new routine
+// 3. CHOREOGRAPHY -- edit these tables for a new routine
 // ---------------------------------------------------------------------
 enum AxisId { A = 0, B = 1, C = 2, D = 3, E = 4 };
 
 struct Move {
-  uint32_t start_ms;   // motion begins, ms after trigger
+  uint32_t start_ms;   // motion begins, ms after this sequence's trigger
   uint32_t end_ms;     // motion ends (axis is at pos_mm), ms after trigger
   AxisId   axis;
   float    pos_mm;     // ABSOLUTE target position, 0 = power-up position
 };
 
-constexpr Move SEQUENCE[] = {
-  { 0000,  5000, A,  200 },
-  { 7000,  12000, A,  0 },
-  { 1000, 5000, B, 20},
-  { 1000, 5000, C, 20},
-  { 8000, 9000, B, 0},
-  { 8000, 9000, C, 0},
-  { 9000, 10000, B, -1},
-  { 9000, 10000, C, -1},
-  { 10000, 12000, B, 20},
-  { 10000, 12000, C, 20},
-
-  { 1000, 4000, D, 20},
-  { 1000, 4000, E, 20},
-  { 4000, 5000, D, 0},
-  { 4000, 5000, E, 0},
-  { 12000, 13000, D, 20},
-  { 12000, 13000, E, 20},
+// PLACEHOLDER VALUES - replace with the real production positions.
+// PRE: power-up (0) -> base. The base is whatever this leaves each axis at.
+constexpr Move PRE_SEQUENCE[] = {
+  { 0, 2000, B, 30 },
+  { 0, 2000, C, 30 },
+  { 0, 2000, D, 30 },
+  { 0, 2000, E, 30 },
 };
-constexpr int SEQUENCE_LEN = sizeof(SEQUENCE) / sizeof(SEQUENCE[0]);
+
+// MAIN: starts at base, must end at base (rule 4) so it can repeat.
+constexpr Move MAIN_SEQUENCE[] = {
+    { 0000,  6000, A,  250 },
+    { 7000,  13000, A,  0 },
+    // { 1000, 5000, B, 30},
+    // { 1000, 5000, C, 30},
+    { 8000, 9000, B, -1},
+    { 8000, 9000, C, -1},
+    // { 9000, 10000, B, -1},
+    // { 9000, 10000, C, -1},
+    { 11000, 12000, B, 30},
+    { 11000, 12000, C, 30},
+
+    { 6000, 7000, D, -4},
+    { 6000, 7000, E, 0},
+    { 13000, 14000, D, 30},
+    { 13000, 14000, E, 30},
+};
+
+// POST: base -> 0 on every axis (rule 4). Axes already at 0 need no row.
+constexpr Move POST_SEQUENCE[] = {
+  { 0, 2000, B, 0 },
+  { 0, 2000, C, 0 },
+  { 0, 2000, D, 0 },
+  { 0, 2000, E, 0 },
+};
+
+constexpr int PRE_LEN  = sizeof(PRE_SEQUENCE)  / sizeof(PRE_SEQUENCE[0]);
+constexpr int MAIN_LEN = sizeof(MAIN_SEQUENCE) / sizeof(MAIN_SEQUENCE[0]);
+constexpr int POST_LEN = sizeof(POST_SEQUENCE) / sizeof(POST_SEQUENCE[0]);
+
+// Sequence ids used throughout: 0 = PRE, 1 = MAIN, 2 = POST
+constexpr const Move* rowsOf(int id) {
+  return id == 0 ? PRE_SEQUENCE : id == 1 ? MAIN_SEQUENCE : POST_SEQUENCE;
+}
+constexpr int lenOf(int id) { return id == 0 ? PRE_LEN : id == 1 ? MAIN_LEN : POST_LEN; }
+constexpr int MAX_LEN =
+  (PRE_LEN > MAIN_LEN ? (PRE_LEN > POST_LEN ? PRE_LEN : POST_LEN)
+                      : (MAIN_LEN > POST_LEN ? MAIN_LEN : POST_LEN));
 
 // ---------------------------------------------------------------------
 // 4. TIMER / ISR CONFIG
@@ -190,18 +246,31 @@ constexpr float   vLimitSteps(int ax) {
   return minF(MAX_SPEED_MM_S[ax] * STEPS_PER_MM[ax], ISR_FREQ_HZ / 2.0f);
 }
 
-// previous row (before row i) on the same axis, or -1
-constexpr int prevRow(int i, int j) {
-  return j < 0 ? -1 : (SEQUENCE[j].axis == SEQUENCE[i].axis ? j : prevRow(i, j - 1));
+// previous row (before row i) in sequence id on the same axis, or -1
+constexpr int prevRow(int id, int i, int j) {
+  return j < 0 ? -1 : (rowsOf(id)[j].axis == rowsOf(id)[i].axis ? j : prevRow(id, i, j - 1));
 }
-constexpr int prevRow(int i) { return prevRow(i, i - 1); }
-// true if no later row uses the same axis as row i
-constexpr bool isLastOfAxis(int i, int j) {
-  return j >= SEQUENCE_LEN ? true : (SEQUENCE[j].axis == SEQUENCE[i].axis ? false : isLastOfAxis(i, j + 1));
+constexpr int prevRow(int id, int i) { return prevRow(id, i, i - 1); }
+// last row in sequence id using axis ax, or -1
+constexpr int lastRow(int id, int ax, int j) {
+  return j < 0 ? -1 : (rowsOf(id)[j].axis == ax ? j : lastRow(id, ax, j - 1));
 }
 
-constexpr int32_t startSteps(int i) {
-  return prevRow(i) < 0 ? 0 : toSteps(SEQUENCE[prevRow(i)].pos_mm, SEQUENCE[i].axis);
+// Where each axis is when a sequence starts / ends, in steps.
+// PRE starts at 0; MAIN starts where PRE ended; POST starts where MAIN ended.
+constexpr int32_t baseSteps(int id, int ax);  // defined below (mutual recursion)
+constexpr int32_t endSteps(int id, int ax) {
+  return lastRow(id, ax, lenOf(id) - 1) < 0
+           ? baseSteps(id, ax)
+           : toSteps(rowsOf(id)[lastRow(id, ax, lenOf(id) - 1)].pos_mm, ax);
+}
+constexpr int32_t baseSteps(int id, int ax) { return id == 0 ? 0 : endSteps(id - 1, ax); }
+
+// where the axis of row i is when row i starts
+constexpr int32_t startSteps(int id, int i) {
+  return prevRow(id, i) < 0
+           ? baseSteps(id, rowsOf(id)[i].axis)
+           : toSteps(rowsOf(id)[prevRow(id, i)].pos_mm, rowsOf(id)[i].axis);
 }
 
 // A profile of accel A (steps/s^2), peak <= vlim, covering D steps in T s
@@ -211,39 +280,51 @@ constexpr bool feasible(float D, float T, float A, float vlim) {
   return (T * T * A >= 4 * D) && (vlim >= A * T / 2 || vlim * vlim - A * T * vlim + A * D <= 0);
 }
 
-constexpr bool rule1(int i) { return SEQUENCE[i].end_ms > SEQUENCE[i].start_ms; }
-constexpr bool rule2(int i) {
-  return prevRow(i) < 0 || SEQUENCE[i].start_ms >= SEQUENCE[prevRow(i)].end_ms;
+constexpr bool rule1(int id, int i) { return rowsOf(id)[i].end_ms > rowsOf(id)[i].start_ms; }
+constexpr bool rule2(int id, int i) {
+  return prevRow(id, i) < 0 || rowsOf(id)[i].start_ms >= rowsOf(id)[prevRow(id, i)].end_ms;
 }
-constexpr bool rule3(int i) {
-  return feasible((float)absI(toSteps(SEQUENCE[i].pos_mm, SEQUENCE[i].axis) - startSteps(i)),
-                  (SEQUENCE[i].end_ms - SEQUENCE[i].start_ms) * 0.001f,
-                  ACCEL_MM_S2[SEQUENCE[i].axis] * STEPS_PER_MM[SEQUENCE[i].axis],
-                  vLimitSteps(SEQUENCE[i].axis));
+constexpr bool rule3(int id, int i) {
+  return feasible((float)absI(toSteps(rowsOf(id)[i].pos_mm, rowsOf(id)[i].axis) - startSteps(id, i)),
+                  (rowsOf(id)[i].end_ms - rowsOf(id)[i].start_ms) * 0.001f,
+                  ACCEL_MM_S2[rowsOf(id)[i].axis] * STEPS_PER_MM[rowsOf(id)[i].axis],
+                  vLimitSteps(rowsOf(id)[i].axis));
 }
-constexpr bool rule4(int i) {
-  return !isLastOfAxis(i, i + 1) || toSteps(SEQUENCE[i].pos_mm, SEQUENCE[i].axis) == 0;
+// per axis: PRE free; MAIN ends where it began; POST ends at 0
+constexpr bool rule4(int id, int ax) {
+  return id == 0 ? true
+       : id == 1 ? endSteps(1, ax) == baseSteps(1, ax)
+                 : endSteps(2, ax) == 0;
 }
-constexpr bool rowOk(int rule, int i) {
-  return rule == 1 ? rule1(i) : rule == 2 ? rule2(i) : rule == 3 ? rule3(i) : rule4(i);
+constexpr bool rowOk(int rule, int id, int i) {
+  return rule == 1 ? rule1(id, i) : rule == 2 ? rule2(id, i) : rule3(id, i);
 }
-// index of first row breaking `rule`, or SEQUENCE_LEN if none
-constexpr int firstBad(int rule, int i) {
-  return i >= SEQUENCE_LEN ? SEQUENCE_LEN : (rowOk(rule, i) ? firstBad(rule, i + 1) : i);
+// first row of sequence id breaking rule 1-3, or -1
+constexpr int firstBadRow(int id, int rule, int i) {
+  return i >= lenOf(id) ? -1 : (rowOk(rule, id, i) ? firstBadRow(id, rule, i + 1) : i);
+}
+// first axis breaking rule 4, or -1
+constexpr int firstBadAxis(int id, int ax) {
+  return ax >= 5 ? -1 : (rule4(id, ax) ? firstBadAxis(id, ax + 1) : ax);
 }
 
-// Instantiating this with a bad Row triggers a static_assert whose compiler
-// output names Row and Rule.
-template <int Row, int Rule> struct SeqRowError {
-  static_assert(Row == SEQUENCE_LEN || Rule != 1, "SEQUENCE rule 1: end_ms must be greater than start_ms");
-  static_assert(Row == SEQUENCE_LEN || Rule != 2, "SEQUENCE rule 2: same-axis rows overlap or are out of order");
-  static_assert(Row == SEQUENCE_LEN || Rule != 3, "SEQUENCE rule 3: move too fast/short for ACCEL_MM_S2, MAX_SPEED_MM_S or ISR rate - lengthen it");
-  // static_assert(Row == SEQUENCE_LEN || Rule != 4, "SEQUENCE rule 4: axis must end at 0 mm so the sequence can be re-run");
+// Instantiating this with a bad Index triggers a static_assert whose compiler
+// output names Index (row, or axis for rule 4), Rule and Seq (0=PRE 1=MAIN 2=POST).
+template <int Index, int Rule, int Seq> struct SeqError {
+  static_assert(Index < 0 || Rule != 1, "SEQUENCE rule 1: end_ms must be greater than start_ms (see <row, rule, seq> in the instantiation line; seq 0=PRE 1=MAIN 2=POST)");
+  static_assert(Index < 0 || Rule != 2, "SEQUENCE rule 2: same-axis rows overlap or are out of order (see <row, rule, seq>; seq 0=PRE 1=MAIN 2=POST)");
+  static_assert(Index < 0 || Rule != 3, "SEQUENCE rule 3: move too fast/short for ACCEL_MM_S2, MAX_SPEED_MM_S or ISR rate - lengthen it (see <row, rule, seq>; seq 0=PRE 1=MAIN 2=POST)");
+  static_assert(Index < 0 || Rule != 4 || Seq != 1, "SEQUENCE rule 4: MAIN_SEQUENCE must end this axis (index = axis 0-4) where it started, i.e. at the PRE end position, so it can repeat");
+  static_assert(Index < 0 || Rule != 4 || Seq != 2, "SEQUENCE rule 4: POST_SEQUENCE must end this axis (index = axis 0-4) at 0 mm");
 };
-static_assert(sizeof(SeqRowError<firstBad(1, 0), 1>) > 0, "SEQUENCE rule 1 failed");
-static_assert(sizeof(SeqRowError<firstBad(2, 0), 2>) > 0, "SEQUENCE rule 2 failed");
-static_assert(sizeof(SeqRowError<firstBad(3, 0), 3>) > 0, "SEQUENCE rule 3 failed");
-// static_assert(sizeof(SeqRowError<firstBad(4, 0), 4>) > 0, "SEQUENCE rule 4 failed");
+#define SEQ_CHECK(id)                                                                  \
+  static_assert(sizeof(SeqError<firstBadRow(id, 1, 0), 1, id>) > 0, "rule 1 failed"); \
+  static_assert(sizeof(SeqError<firstBadRow(id, 2, 0), 2, id>) > 0, "rule 2 failed"); \
+  static_assert(sizeof(SeqError<firstBadRow(id, 3, 0), 3, id>) > 0, "rule 3 failed"); \
+  static_assert(sizeof(SeqError<firstBadAxis(id, 0),   4, id>) > 0, "rule 4 failed")
+SEQ_CHECK(0);
+SEQ_CHECK(1);
+SEQ_CHECK(2);
 
 constexpr bool cfgOk(int a) {
   return a >= 5 ? true : (STEPS_PER_MM[a] > 0 && MAX_SPEED_MM_S[a] > 0 && ACCEL_MM_S2[a] > 0 && cfgOk(a + 1));
@@ -275,9 +356,13 @@ volatile AxisState axisState[5];
 // Loop-side only
 int32_t posSteps[5] = {0, 0, 0, 0, 0};  // commanded absolute position, steps
 
-bool moveTriggered[SEQUENCE_LEN];
-bool sequenceStarted = false;
+// Sequencer state
+bool     moveTriggered[MAX_LEN];
+bool     running = false;     // a sequence is in progress
+int      curId = 0;           // which one: 0 PRE, 1 MAIN, 2 POST
+bool     atBase = false;      // false = at 0 (power-up / after POST), true = at base
 uint32_t sequenceStart = 0;
+const char* const SEQ_NAME[3] = { "PRE", "MAIN", "POST" };
 
 // ---------------------------------------------------------------------
 // Fast pin resolution: bind once at setup(), use raw register writes after.
@@ -309,7 +394,7 @@ void setup() {
     axisState[axis].active = false;
   }
 
-  for (int i = 0; i < SEQUENCE_LEN; i++) moveTriggered[i] = false;
+  for (int i = 0; i < MAX_LEN; i++) moveTriggered[i] = false;
 
   // Timer1 CTC, prescaler 8: OCR1A = F_CPU/8/ISR_FREQ_HZ - 1
   noInterrupts();
@@ -425,23 +510,23 @@ bool startAxisMove(AxisId axis, float target_mm, uint32_t duration_ms) {
 }
 
 // ---------------------------------------------------------------------
-// Non-blocking start trigger: serial byte OR debounced button.
+// Non-blocking command input: next serial byte, or the start button
+// (edge-triggered: one START_BYTE per press, after a 25 ms debounce).
+// Returns 0 if nothing arrived.
 // ---------------------------------------------------------------------
-bool checkStartTrigger() {
-  if (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == START_BYTE) return true;
-  }
+char readCommand() {
+  if (Serial.available() > 0) return (char)Serial.read();
 
   static uint32_t lowSince = 0;
-  bool pressed = (digitalRead(START_BUTTON_PIN) == LOW);
-  if (pressed) {
+  static bool fired = false;
+  if (digitalRead(START_BUTTON_PIN) == LOW) {
     if (lowSince == 0) lowSince = millis();
-    else if (millis() - lowSince > 25) return true; // debounced
+    else if (!fired && millis() - lowSince > 25) { fired = true; return START_BYTE; }
   } else {
     lowSince = 0;
+    fired = false;
   }
-  return false;
+  return 0;
 }
 
 bool anyAxisActive() {
@@ -451,33 +536,48 @@ bool anyAxisActive() {
   return false;
 }
 
+void beginSequence(int id) {
+  curId = id;
+  for (int i = 0; i < MAX_LEN; i++) moveTriggered[i] = false;
+  sequenceStart = millis();
+  running = true;
+  Serial.print(F("START ")); Serial.println(SEQ_NAME[id]);
+}
+
 void loop() {
-  if (!sequenceStarted) {
-    if (checkStartTrigger()) {
-      sequenceStarted = true;
-      sequenceStart = millis();
+  if (!running) {
+    char c = readCommand();
+    if (c == PRE_BYTE) {
+      if (atBase) Serial.println(F("IGNORED P: already at base, send Z first"));
+      else        beginSequence(0);
+    } else if (c == START_BYTE) {
+      if (!atBase) Serial.println(F("IGNORED S: not at base, send P first"));
+      else         beginSequence(1);
+    } else if (c == POST_BYTE) {
+      if (!atBase) Serial.println(F("IGNORED Z: already at 0"));
+      else         beginSequence(2);
     }
     return;
   }
 
+  const Move *rows = rowsOf(curId);
+  int len = lenOf(curId);
   uint32_t elapsed = millis() - sequenceStart;
   bool allArmed = true;
-  for (int i = 0; i < SEQUENCE_LEN; i++) {
+  for (int i = 0; i < len; i++) {
     if (moveTriggered[i]) continue;
     allArmed = false;
-    if (elapsed >= SEQUENCE[i].start_ms &&
-        startAxisMove(SEQUENCE[i].axis, SEQUENCE[i].pos_mm,
-                      SEQUENCE[i].end_ms - SEQUENCE[i].start_ms)) {
+    if (elapsed >= rows[i].start_ms &&
+        startAxisMove(rows[i].axis, rows[i].pos_mm, rows[i].end_ms - rows[i].start_ms)) {
       moveTriggered[i] = true;
     }
   }
 
-  // Sequence finished: every move armed and every axis has stopped.
+  // Finished: every move armed and every axis has stopped.
   if (allArmed && !anyAxisActive()) {
-    sequenceStarted = false;
-    for (int i = 0; i < SEQUENCE_LEN; i++) moveTriggered[i] = false;
-    while (Serial.available() > 0) Serial.read();      // drop 'S' sent mid-run
-    while (digitalRead(START_BUTTON_PIN) == LOW) {}    // wait for button release
-    Serial.println(F("DONE"));
+    running = false;
+    atBase = (curId != 2);                              // PRE and MAIN leave us at base, POST at 0
+    while (Serial.available() > 0) Serial.read();       // drop commands sent mid-run
+    Serial.print(F("DONE ")); Serial.println(SEQ_NAME[curId]);
   }
 }
